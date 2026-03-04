@@ -1,0 +1,228 @@
+import os
+import logging
+import anthropic
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters, ConversationHandler,
+)
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+MAIN_MENU, WAITING_HER_MESSAGE, WAITING_CONTEXT, WAITING_SITUATION = range(4)
+
+REPLY_SYSTEM_PROMPT = """Ты — мастер общения с девушками. Твоя задача: придумать идеальный ответ на сообщение девушки.
+
+СТИЛЬ (строго следуй):
+- Уверенный, но не грубый
+- Игривый, с лёгкой провокацией
+- Короткий и хлёсткий — максимум 1-2 предложения
+- Создаёт интригу, не раскрывает всё сразу
+- Обрабатывает любые возражения с юмором, не оправдывается
+- Никогда не заискивает и не умоляет
+- Живой язык, никаких канцелярских фраз
+
+ПРИМЕРЫ правильных ответов:
+- На "Это просто домашний лук" -> "Это не лук, это провокация. И я на неё повёлся"
+- На "Я не искала внимания, так что мимо кассы" -> "Внимание нашло тебя само. Сопротивление бесполезно, предлагаю сдаться в плен"
+- На "Слишком гладко стелешь" -> "С простыми скучно. Я буду твоим guilty pleasure, о котором стыдно рассказать, но невозможно забыть"
+- На "Например?" -> "Угадываю желания до того, как ты их загадала. Спорим?"
+
+Давай 3 варианта ответа — разного стиля (один острее, один мягче, один с интригой).
+Нумеруй: 1, 2, 3
+В конце — одна короткая ремарка почему это работает."""
+
+OPENER_SYSTEM_PROMPT = """Ты — мастер первых сообщений девушкам.
+
+СТИЛЬ:
+- Цепляет с первой строки
+- Не банальное "привет, как дела"
+- Реагирует на конкретную деталь (фото, история, описание)
+- Игривое, уверенное, создаёт интригу
+- Максимум 1-2 предложения
+
+Давай 3 варианта первого сообщения.
+Нумеруй: 1, 2, 3
+В конце — одна короткая ремарка почему это работает."""
+
+DATE_SYSTEM_PROMPT = """Ты — мастер закрытия на свидание в переписке.
+
+СТИЛЬ:
+- Уверенное предложение, без "может быть" и "если хочешь"
+- Конкретное, с деталью (место/идея)
+- Лёгкое давление через интригу или юмор
+- Не умоляет, а создаёт ощущение что она теряет что-то интересное
+
+Давай 3 варианта как закрыть на встречу.
+Нумеруй: 1, 2, 3
+В конце — одна короткая ремарка почему это работает."""
+
+def call_claude(system, user_message):
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        system=system,
+        messages=[{"role": "user", "content": user_message}],
+    )
+    return msg.content[0].text
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Ответить на её сообщение", callback_data="reply")],
+        [InlineKeyboardButton("👋 Первое сообщение", callback_data="opener")],
+        [InlineKeyboardButton("📅 Закрыть на свидание", callback_data="date")],
+    ])
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]])
+
+def regen_keyboard(action):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Ещё варианты", callback_data="regen_" + action)],
+        [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
+    ])
+
+async def start(update, context):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "👋 Привет! Помогу тебе общаться с девушкой так, чтобы она сама писала первой.\n\nЧто хочешь сделать?",
+        reply_markup=main_keyboard()
+    )
+    return MAIN_MENU
+
+async def menu_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Что хочешь сделать?", reply_markup=main_keyboard())
+    return MAIN_MENU
+
+async def reply_chosen(update, context):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["action"] = "reply"
+    await query.edit_message_text(
+        "💬 Скопируй сюда её сообщение — то, на которое хочешь ответить:\n\nМожно вставить несколько сообщений для контекста.",
+        reply_markup=back_keyboard()
+    )
+    return WAITING_HER_MESSAGE
+
+async def opener_chosen(update, context):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["action"] = "opener"
+    await query.edit_message_text(
+        "👋 Расскажи о ней — откуда знаешь, что в профиле/истории, любая деталь:\n\nНапример: 'познакомились на вечеринке, она любит джаз'",
+        reply_markup=back_keyboard()
+    )
+    return WAITING_SITUATION
+
+async def date_chosen(update, context):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["action"] = "date"
+    await query.edit_message_text(
+        "📅 Опиши контекст — сколько общаетесь, о чём говорили, был ли уже флирт:",
+        reply_markup=back_keyboard()
+    )
+    return WAITING_CONTEXT
+
+async def handle_her_message(update, context):
+    her_msg = update.message.text
+    context.user_data["her_message"] = her_msg
+    thinking = await update.message.reply_text("🧠 Думаю над ответом...")
+    try:
+        result = call_claude(REPLY_SYSTEM_PROMPT, "Её сообщение: " + her_msg)
+        await thinking.delete()
+        await update.message.reply_text(
+            "💬 Варианты ответа:\n\n" + result,
+            reply_markup=regen_keyboard("reply")
+        )
+    except Exception as e:
+        logger.error(e)
+        await thinking.edit_text("⚠️ Ошибка. Попробуй /start")
+    return MAIN_MENU
+
+async def handle_situation(update, context):
+    situation = update.message.text
+    action = context.user_data.get("action", "opener")
+    context.user_data["last_situation"] = situation
+    system = OPENER_SYSTEM_PROMPT if action == "opener" else DATE_SYSTEM_PROMPT
+    label = "👋 Варианты первого сообщения:" if action == "opener" else "📅 Варианты закрытия на свидание:"
+    thinking = await update.message.reply_text("🧠 Генерирую...")
+    try:
+        result = call_claude(system, situation)
+        await thinking.delete()
+        await update.message.reply_text(
+            label + "\n\n" + result,
+            reply_markup=regen_keyboard(action)
+        )
+    except Exception as e:
+        logger.error(e)
+        await thinking.edit_text("⚠️ Ошибка. Попробуй /start")
+    return MAIN_MENU
+
+async def regenerate(update, context):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.replace("regen_", "")
+    await query.edit_message_text("🧠 Генерирую новые варианты...")
+    try:
+        if action == "reply":
+            her_msg = context.user_data.get("her_message", "")
+            result = call_claude(REPLY_SYSTEM_PROMPT, "Её сообщение: " + her_msg)
+            label = "💬 Новые варианты ответа:"
+        elif action == "opener":
+            situation = context.user_data.get("last_situation", "")
+            result = call_claude(OPENER_SYSTEM_PROMPT, situation)
+            label = "👋 Новые варианты первого сообщения:"
+        else:
+            situation = context.user_data.get("last_situation", "")
+            result = call_claude(DATE_SYSTEM_PROMPT, situation)
+            label = "📅 Новые варианты закрытия на свидание:"
+        await query.edit_message_text(
+            label + "\n\n" + result,
+            reply_markup=regen_keyboard(action)
+        )
+    except Exception as e:
+        logger.error(e)
+        await query.edit_message_text("⚠️ Ошибка. Попробуй /start")
+    return MAIN_MENU
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            MAIN_MENU: [
+                CallbackQueryHandler(reply_chosen, pattern="^reply$"),
+                CallbackQueryHandler(opener_chosen, pattern="^opener$"),
+                CallbackQueryHandler(date_chosen, pattern="^date$"),
+                CallbackQueryHandler(regenerate, pattern="^regen_"),
+                CallbackQueryHandler(menu_callback, pattern="^menu$"),
+            ],
+            WAITING_HER_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_her_message),
+                CallbackQueryHandler(menu_callback, pattern="^menu$"),
+            ],
+            WAITING_SITUATION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_situation),
+                CallbackQueryHandler(menu_callback, pattern="^menu$"),
+            ],
+            WAITING_CONTEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_situation),
+                CallbackQueryHandler(menu_callback, pattern="^menu$"),
+            ],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+    app.add_handler(conv)
+    logger.info("Бот запущен!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
